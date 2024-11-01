@@ -1,0 +1,252 @@
+from flask import Flask, request, jsonify
+import socket
+import requests
+import time
+import threading
+import mysql.connector
+from mysql.connector import pooling
+import json
+import subprocess
+import socketio
+import board
+import busio
+from adafruit_mcp230xx.mcp23008 import MCP23008
+from adafruit_mcp230xx.mcp23017 import MCP23017
+
+app = Flask(__name__)
+
+hostname = socket.gethostname()
+sio = socketio.Client()
+
+# Database configuration
+db_config = {
+    'host': '10.110.10.204',
+    'user': 'root',
+    'password': 'Passw0rd123',
+    'database': 'PickByLight'
+}
+
+# Set up database connection pool
+mysql_pool = pooling.MySQLConnectionPool(
+    pool_name="mysql_pool",
+    pool_size=5,
+    **db_config
+)
+
+def get_db_connection():
+    return mysql_pool.get_connection()
+
+# Set up I2C bus
+i2c = busio.I2C(board.SCL, board.SDA)
+
+# Initialize MCP devices for expanders on addresses 0x20 to 0x27
+mcp_devices = {f"0x{20 + i:02x}": (MCP23017(i2c, address=0x20 + i) if i < 4 else MCP23008(i2c, address=0x20 + i)) for i in range(8)}
+
+# Track LED and button status
+led_status = {}
+
+# Get IP address of the Raspberry Pi
+def get_ip_address():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+# Fetch configuration from the database and parse JSON fields
+def fetch_configuration():
+    ip_address = get_ip_address()
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM rasp_pi_configurations WHERE ip_address = %s', (ip_address,))
+        config = cursor.fetchone()
+        if config:
+            # Parse JSON fields for expanders and pins
+            config['led_expander_address'] = json.loads(config['led_expander_address'])
+            config['led_pin'] = json.loads(config['led_pin'])
+            config['button_expander_address'] = json.loads(config['button_expander_address'])
+            config['button_pin'] = json.loads(config['button_pin'])
+            config['status_led_pin'] = json.loads(config['status_led_pin'])
+            return config
+        return {}
+    except mysql.connector.Error as err:
+        print(f"Database error: {err}")
+        return {}
+    finally:
+        cursor.close()
+        connection.close()
+
+config = fetch_configuration()
+
+# Initialize GPIO pins using the parsed configuration
+def initialize_gpio(config):
+    for material, led_addr in config['led_expander_address'].items():
+        led_pin_num = config['led_pin'][material]
+        button_addr = config['button_expander_address'][material]
+        button_pin_num = config['button_pin'][material]
+        
+        led_expander = mcp_devices.get(led_addr)
+        button_expander = mcp_devices.get(button_addr)
+
+        # Setup LED pin
+        led_pin = led_expander.get_pin(led_pin_num)
+        led_pin.switch_to_output(value=False)  # LED off initially
+        led_status[material] = False  # Track LED status
+        
+        # Setup button pin
+        button_pin = button_expander.get_pin(button_pin_num)
+        button_pin.switch_to_input(pull=button_pin.PULL_UP)
+
+# Verify LEDs by blinking each one briefly
+def verify_leds():
+    print("Verifying LEDs...")
+    for material, led_addr in config['led_expander_address'].items():
+        led_pin_num = config['led_pin'][material]
+        led_expander = mcp_devices.get(led_addr)
+        led_pin = led_expander.get_pin(led_pin_num)
+        
+        led_pin.value = True  # Turn on LED
+        time.sleep(0.5)       # Wait briefly
+        led_pin.value = False  # Turn off LED
+        time.sleep(0.2)       # Pause before next
+
+# Activate LEDs for materials one by one, waiting for button press confirmation
+@app.route('/activate_led', methods=['POST'])
+def activate_led():
+    data = request.json
+    materials = data.get('materials', [])
+    machine_name = data.get('machine_name')
+    
+    if not materials or not machine_name:
+        return jsonify({'error': 'No materials or machine_name provided'}), 400
+
+    for material in materials:
+        led_addr = config['led_expander_address'].get(material)
+        led_pin_num = config['led_pin'].get(material)
+        button_addr = config['button_expander_address'].get(material)
+        button_pin_num = config['button_pin'].get(material)
+
+        if led_addr and led_pin_num is not None:
+            # Get expander and pins for the material
+            led_expander = mcp_devices.get(led_addr)
+            led_pin = led_expander.get_pin(led_pin_num)
+            button_expander = mcp_devices.get(button_addr)
+            button_pin = button_expander.get_pin(button_pin_num)
+
+            # Turn on the LED for the current material
+            led_pin.value = True
+            led_status[material] = True  # Mark this LED as on
+            print(f"LED for {material} activated for machine {machine_name}. Waiting for confirmation.")
+
+            # Wait for button press confirmation
+            while True:
+                if not button_pin.value:  # Assuming button press pulls the pin LOW
+                    led_pin.value = False  # Turn off the LED after confirmation
+                    led_status[material] = False  # Mark this LED as off
+                    print(f"Confirmation received for {material}. Moving to next material for machine {machine_name}.")
+                    time.sleep(0.5)  # Add small delay to debounce
+
+                    # Send the confirmation back to the server
+                    try:
+                        response = requests.post(f'http://10.110.10.204:5001/confirmation_material', 
+                                                 json={'material': material, 'hostname': hostname, 'machine_name': machine_name})
+                        response.raise_for_status()
+                    except requests.RequestException as e:
+                        print(f"Error sending confirmation for {material}: {e}")
+                    break
+        else:
+            return jsonify({'error': f'Invalid material: {material}'}), 400
+
+    return jsonify({'status': f'All materials processed for machine {machine_name}'}), 200
+
+# Deactivate a specified LED
+@app.route('/deactivate_led', methods=['POST'])
+def deactivate_led():
+    data = request.json
+    material = data.get('material')
+
+    led_addr = config['led_expander_address'].get(material)
+    led_pin_num = config['led_pin'].get(material)
+    
+    if led_addr and led_pin_num is not None:
+        led_expander = mcp_devices.get(led_addr)
+        led_pin = led_expander.get_pin(led_pin_num)
+        
+        led_pin.value = False
+        led_status[material] = False  # Mark the LED as off
+        return jsonify({'status': 'LED deactivated'}), 200
+    return jsonify({'error': 'Invalid material'}), 400
+
+# Check network connectivity by pinging the server
+def check_network():
+    try:
+        result = subprocess.run(['ping', '-c', '1', '10.110.10.204'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+# Blink the status LED a specified number of times
+def blink_status_led(times=3):
+    status_addr = config['status_led_pin']['address']
+    status_pin_num = config['status_led_pin']['pin_number']
+    status_expander = mcp_devices.get(status_addr)
+    status_led_pin = status_expander.get_pin(status_pin_num)
+
+    for _ in range(times):
+        status_led_pin.value = True
+        time.sleep(0.2)
+        status_led_pin.value = False
+        time.sleep(0.2)
+
+# Connect to the Flask server via SocketIO
+def connect_socketio():
+    try:
+        sio.connect('http://10.110.10.204:5001')
+        print("Connected to Flask server via SocketIO.")
+    except Exception as e:
+        print(f"Failed to connect to Flask server: {e}")
+
+# Run Flask app in a separate thread
+def run_flask():
+    app.run(host='0.0.0.0', port=5000)
+
+# Main function to manage the server and GPIOs
+def main():
+    config = fetch_configuration()
+    if not config:
+        print("No configuration found for this Raspberry Pi.")
+        return
+
+    initialize_gpio(config)
+    verify_leds()  # Verify LEDs by blinking them once
+
+    try:
+        # Start Flask server in a separate thread
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+
+        # Connect to the server for configuration updates
+        connect_socketio()
+
+        # Main loop to check network and handle status LED
+        while True:
+            if check_network():
+                blink_status_led(1)  # Blink once if connected
+                time.sleep(5)
+            else:
+                print("Network disconnected.")
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    finally:
+        print("Cleaning up GPIO")
+        for device in mcp_devices.values():
+            device.reset_pins()  # Ensure all expander pins are reset
+
+if __name__ == '__main__':
+    main()
