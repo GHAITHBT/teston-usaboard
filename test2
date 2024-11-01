@@ -1,0 +1,159 @@
+from flask import Flask, request, jsonify
+import socket
+import requests
+import time
+import threading
+import mysql.connector
+from mysql.connector import pooling
+import json
+import subprocess
+import socketio
+import board
+import busio
+from adafruit_mcp230xx.mcp23008 import MCP23008
+from adafruit_mcp230xx.mcp23017 import MCP23017
+from digitalio import Direction, Pull
+
+app = Flask(__name__)
+
+hostname = socket.gethostname()
+sio = socketio.Client()
+
+# Database configuration
+db_config = {
+    'host': '10.110.10.204',
+    'user': 'root',
+    'password': 'Passw0rd123',
+    'database': 'PickByLight'
+}
+
+# Set up database connection pool
+mysql_pool = pooling.MySQLConnectionPool(
+    pool_name="mysql_pool",
+    pool_size=5,
+    **db_config
+)
+
+def get_db_connection():
+    return mysql_pool.get_connection()
+
+# Set up I2C bus
+i2c = busio.I2C(board.SCL, board.SDA)
+
+# Initialize MCP devices for expanders on specified addresses
+mcp_devices = {
+    "0x20": MCP23017(i2c, address=0x20),
+    "0x23": MCP23017(i2c, address=0x23),
+    "0x24": MCP23017(i2c, address=0x24),
+    "0x27": MCP23017(i2c, address=0x27),
+    "0x21": MCP23008(i2c, address=0x21),
+    "0x22": MCP23008(i2c, address=0x22),
+    "0x25": MCP23008(i2c, address=0x25),
+    "0x26": MCP23008(i2c, address=0x26)
+}
+
+# Track LED and button status
+led_status = {}
+
+# Fetch configuration from the database and parse JSON fields
+def fetch_configuration():
+    connection = get_db_connection()
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute('SELECT * FROM rasp_pi_configurations WHERE ip_address = %s', (get_ip_address(),))
+        config = cursor.fetchone()
+        if config:
+            # Parse JSON fields for expanders and pins
+            config['led_expander_address'] = json.loads(config['led_expander_address'])
+            config['led_pin'] = json.loads(config['led_pin'])
+            config['button_expander_address'] = json.loads(config['button_expander_address'])
+            config['button_pin'] = json.loads(config['button_pin'])
+            return config
+        return {}
+    finally:
+        cursor.close()
+        connection.close()
+
+config = fetch_configuration()
+
+# Initialize GPIO pins using the parsed configuration
+def initialize_gpio(config):
+    for material, led_addr in config['led_expander_address'].items():
+        led_pin_num = config['led_pin'][material]
+        button_addr = config['button_expander_address'][material]
+        button_pin_num = config['button_pin'][material]
+        
+        led_expander = mcp_devices.get(led_addr)
+        button_expander = mcp_devices.get(button_addr)
+
+        # Setup LED pin if expanders exist
+        if led_expander and button_expander:
+            led_pin = led_expander.get_pin(led_pin_num)
+            led_pin.direction = Direction.OUTPUT
+            led_pin.value = False  # LED initially off
+            
+            button_pin = button_expander.get_pin(button_pin_num)
+            button_pin.direction = Direction.INPUT
+            button_pin.pull = Pull.UP  # Enable internal pull-up
+            led_status[material] = False  # Track LED status
+        else:
+            print(f"Error: Invalid expander address for material {material}")
+
+# Activate LEDs for materials, turning off upon button press
+@app.route('/activate_led', methods=['POST'])
+def activate_led():
+    data = request.json
+    materials = data.get('materials', [])
+    machine_name = data.get('machine_name')
+    
+    if not materials or not machine_name:
+        return jsonify({'error': 'No materials or machine_name provided'}), 400
+
+    for material in materials:
+        led_addr = config['led_expander_address'].get(material)
+        led_pin_num = config['led_pin'].get(material)
+        button_addr = config['button_expander_address'].get(material)
+        button_pin_num = config['button_pin'].get(material)
+
+        led_expander = mcp_devices.get(led_addr)
+        button_expander = mcp_devices.get(button_addr)
+
+        if led_expander and button_expander:
+            led_pin = led_expander.get_pin(led_pin_num)
+            button_pin = button_expander.get_pin(button_pin_num)
+
+            # Turn on the LED
+            led_pin.value = True
+            led_status[material] = True  # Mark this LED as on
+            print(f"LED for {material} activated. Waiting for button press...")
+
+            # Wait for button press
+            while True:
+                if not button_pin.value:  # Button pressed (reads as low)
+                    led_pin.value = False  # Turn LED off
+                    led_status[material] = False  # Mark this LED as off
+                    print(f"Button pressed for {material}. LED is now OFF.")
+                    break
+                time.sleep(0.1)  # Check button state with a short delay
+        else:
+            return jsonify({'error': f'Invalid material: {material}'}), 400
+
+    return jsonify({'status': 'Materials processed successfully'}), 200
+
+# Main function to initialize GPIOs
+def main():
+    if not config:
+        print("No configuration found.")
+        return
+
+    initialize_gpio(config)
+    print("GPIO initialized.")
+
+    try:
+        # Start Flask app
+        app.run(host='0.0.0.0', port=5000)
+    except KeyboardInterrupt:
+        print("\nExiting...")
+
+if __name__ == '__main__':
+    main()
