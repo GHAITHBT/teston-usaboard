@@ -39,8 +39,17 @@ def get_db_connection():
 # Set up I2C bus
 i2c = busio.I2C(board.SCL, board.SDA)
 
-# Initialize MCP devices for expanders on addresses 0x20 to 0x27
-mcp_devices = {f"0x{20 + i:02x}": (MCP23017(i2c, address=0x20 + i) if i < 4 else MCP23008(i2c, address=0x20 + i)) for i in range(8)}
+# Initialize MCP devices for expanders on specified addresses
+mcp_devices = {
+    "0x20": MCP23017(i2c, address=0x20),
+    "0x23": MCP23017(i2c, address=0x23),
+    "0x24": MCP23017(i2c, address=0x24),
+    "0x27": MCP23017(i2c, address=0x27),
+    "0x21": MCP23008(i2c, address=0x21),
+    "0x22": MCP23008(i2c, address=0x22),
+    "0x25": MCP23008(i2c, address=0x25),
+    "0x26": MCP23008(i2c, address=0x26)
+}
 
 # Track LED and button status
 led_status = {}
@@ -93,14 +102,18 @@ def initialize_gpio(config):
         led_expander = mcp_devices.get(led_addr)
         button_expander = mcp_devices.get(button_addr)
 
-        # Setup LED pin
-        led_pin = led_expander.get_pin(led_pin_num)
-        led_pin.switch_to_output(value=False)  # LED off initially
-        led_status[material] = False  # Track LED status
-        
-        # Setup button pin
-        button_pin = button_expander.get_pin(button_pin_num)
-        button_pin.switch_to_input(pull=button_pin.PULL_UP)
+        # Verify devices exist before accessing pins
+        if led_expander and button_expander:
+            # Setup LED pin
+            led_pin = led_expander.get_pin(led_pin_num)
+            led_pin.switch_to_output(value=False)  # LED off initially
+            led_status[material] = False  # Track LED status
+            
+            # Setup button pin
+            button_pin = button_expander.get_pin(button_pin_num)
+            button_pin.switch_to_input(pull=button_pin.PULL_UP)
+        else:
+            print(f"Error: Expander not found for material {material} with LED address {led_addr} or Button address {button_addr}")
 
 # Verify LEDs by blinking each one briefly
 def verify_leds():
@@ -108,12 +121,15 @@ def verify_leds():
     for material, led_addr in config['led_expander_address'].items():
         led_pin_num = config['led_pin'][material]
         led_expander = mcp_devices.get(led_addr)
-        led_pin = led_expander.get_pin(led_pin_num)
-        
-        led_pin.value = True  # Turn on LED
-        time.sleep(0.5)       # Wait briefly
-        led_pin.value = False  # Turn off LED
-        time.sleep(0.2)       # Pause before next
+
+        if led_expander:
+            led_pin = led_expander.get_pin(led_pin_num)
+            led_pin.value = True  # Turn on LED
+            time.sleep(0.5)       # Wait briefly
+            led_pin.value = False  # Turn off LED
+            time.sleep(0.2)       # Pause before next
+        else:
+            print(f"Error: Expander not found for material {material} with LED address {led_addr}")
 
 # Activate LEDs for materials one by one, waiting for button press confirmation
 @app.route('/activate_led', methods=['POST'])
@@ -131,11 +147,11 @@ def activate_led():
         button_addr = config['button_expander_address'].get(material)
         button_pin_num = config['button_pin'].get(material)
 
-        if led_addr and led_pin_num is not None:
-            # Get expander and pins for the material
-            led_expander = mcp_devices.get(led_addr)
+        led_expander = mcp_devices.get(led_addr)
+        button_expander = mcp_devices.get(button_addr)
+
+        if led_expander and led_pin_num is not None and button_expander:
             led_pin = led_expander.get_pin(led_pin_num)
-            button_expander = mcp_devices.get(button_addr)
             button_pin = button_expander.get_pin(button_pin_num)
 
             # Turn on the LED for the current material
@@ -173,10 +189,10 @@ def deactivate_led():
     led_addr = config['led_expander_address'].get(material)
     led_pin_num = config['led_pin'].get(material)
     
-    if led_addr and led_pin_num is not None:
-        led_expander = mcp_devices.get(led_addr)
+    led_expander = mcp_devices.get(led_addr)
+
+    if led_expander and led_pin_num is not None:
         led_pin = led_expander.get_pin(led_pin_num)
-        
         led_pin.value = False
         led_status[material] = False  # Mark the LED as off
         return jsonify({'status': 'LED deactivated'}), 200
@@ -195,13 +211,14 @@ def blink_status_led(times=3):
     status_addr = config['status_led_pin']['address']
     status_pin_num = config['status_led_pin']['pin_number']
     status_expander = mcp_devices.get(status_addr)
-    status_led_pin = status_expander.get_pin(status_pin_num)
 
-    for _ in range(times):
-        status_led_pin.value = True
-        time.sleep(0.2)
-        status_led_pin.value = False
-        time.sleep(0.2)
+    if status_expander:
+        status_led_pin = status_expander.get_pin(status_pin_num)
+        for _ in range(times):
+            status_led_pin.value = True
+            time.sleep(0.2)
+            status_led_pin.value = False
+            time.sleep(0.2)
 
 # Connect to the Flask server via SocketIO
 def connect_socketio():
